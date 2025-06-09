@@ -18,7 +18,7 @@ const cache = globalForSunoApi.sunoApiCache || new Map<string, SunoApi>();
 globalForSunoApi.sunoApiCache = cache;
 
 const logger = pino();
-export const DEFAULT_MODEL = 'chirp-v3-5';
+export const DEFAULT_MODEL = 'chirp-v4-5';
 
 export interface AudioInfo {
   id: string; // Unique identifier for the audio
@@ -518,7 +518,7 @@ class SunoApi {
       tags,
       title,
       make_instrumental,
-      model,
+      model || DEFAULT_MODEL,
       wait_audio,
       negative_tags
     );
@@ -534,67 +534,45 @@ class SunoApi {
    * Generates songs based on the provided parameters.
    *
    * @param prompt The text prompt to generate songs from.
-   * @param isCustom Indicates if the generation should consider custom parameters like tags and title.
-   * @param tags Optional tags to categorize the song, used only if isCustom is true.
-   * @param title Optional title for the song, used only if isCustom is true.
+   * @param customized Indicates if the generation should consider custom parameters like tags and title.
+   * @param tags Optional tags to categorize the song, used only if customized is true.
+   * @param title Optional title for the song, used only if customized is true.
    * @param make_instrumental Indicates if the generated song should be instrumental.
    * @param wait_audio Indicates if the method should wait for the audio file to be fully generated before returning.
    * @param negative_tags Negative tags that should not be included in the generated audio.
-   * @param task Optional indication of what to do. Enter 'extend' if extending an audio, otherwise specify null.
-   * @param continue_clip_id 
    * @returns A promise that resolves to an array of AudioInfo objects representing the generated songs.
    */
   private async generateSongs(
     prompt: string,
-    isCustom: boolean,
+    customized?: boolean,
     tags?: string,
     title?: string,
     make_instrumental?: boolean,
     model?: string,
-    wait_audio: boolean = false,
-    negative_tags?: string,
-    task?: string,
-    continue_clip_id?: string,
-    continue_at?: number
+    wait_audio?: boolean,
+    negative_tags?: string
   ): Promise<AudioInfo[]> {
     await this.keepAlive();
     const payload: any = {
-      make_instrumental: make_instrumental,
-      mv: model || DEFAULT_MODEL,
-      prompt: '',
-      generation_type: 'TEXT',
-      continue_at: continue_at,
-      continue_clip_id: continue_clip_id,
-      task: task,
-      token: await this.getCaptcha()
+      make_instrumental: make_instrumental || false,
+      model: model || DEFAULT_MODEL,
+      prompt: prompt,
     };
-    if (isCustom) {
-      payload.tags = tags;
-      payload.title = title;
-      payload.negative_tags = negative_tags;
-      payload.prompt = prompt;
-    } else {
-      payload.gpt_description_prompt = prompt;
+
+    if (customized) {
+      payload.tags = tags || '';
+      payload.title = title || '';
+      if (negative_tags) {
+        payload.negative_prompt = negative_tags;
+      }
     }
-    logger.info(
-      'generateSongs payload:\n' +
-        JSON.stringify(
-          {
-            prompt: prompt,
-            isCustom: isCustom,
-            tags: tags,
-            title: title,
-            make_instrumental: make_instrumental,
-            wait_audio: wait_audio,
-            negative_tags: negative_tags,
-            payload: payload
-          },
-          null,
-          2
-        )
-    );
+
+    if (wait_audio !== undefined) {
+      payload.wait_audio = wait_audio;
+    }
+
     const response = await this.client.post(
-      `${SunoApi.BASE_URL}/api/generate/v2/`,
+      `${SunoApi.BASE_URL}/api/v2/generate`,
       payload,
       {
         timeout: 10000 // 10 seconds timeout
@@ -603,7 +581,27 @@ class SunoApi {
     if (response.status !== 200) {
       throw new Error('Error response:' + response.statusText);
     }
-    const songIds = response.data.clips.map((audio: any) => audio.id);
+    
+    logger.info('Generate API Response:', JSON.stringify(response.data, null, 2));
+    
+    // Handle new API response format
+    let clips = [];
+    if (response.data && Array.isArray(response.data)) {
+      clips = response.data;
+    } else if (response.data.data && Array.isArray(response.data.data)) {
+      clips = response.data.data;
+    } else if (response.data.clips && Array.isArray(response.data.clips)) {
+      clips = response.data.clips;
+    } else {
+      // Fallback for single clip response
+      if (response.data.id) {
+        clips = [response.data];
+      } else {
+        throw new Error('Unexpected response format: ' + JSON.stringify(response.data));
+      }
+    }
+    
+    const songIds = clips.map((audio: any) => audio.id);
     //Want to wait for music file generation
     if (wait_audio) {
       const startTime = Date.now();
@@ -624,53 +622,64 @@ class SunoApi {
       }
       return lastResponse;
     } else {
-      return response.data.clips.map((audio: any) => ({
+      return clips.map((audio: any) => ({
         id: audio.id,
         title: audio.title,
-        image_url: audio.image_url,
-        lyric: audio.metadata.prompt,
-        audio_url: audio.audio_url,
+        image_url: audio.image_url || audio.source_image_url,
+        lyric: make_instrumental ? '' : (audio.lyric || audio.lyrics || ''),
+        audio_url: audio.audio_url || audio.source_audio_url,
         video_url: audio.video_url,
-        created_at: audio.created_at,
+        created_at: audio.created_at || audio.createTime,
         model_name: audio.model_name,
         status: audio.status,
-        gpt_description_prompt: audio.metadata.gpt_description_prompt,
-        prompt: audio.metadata.prompt,
-        type: audio.metadata.type,
-        tags: audio.metadata.tags,
-        negative_tags: audio.metadata.negative_tags,
-        duration: audio.metadata.duration
+        gpt_description_prompt: audio.gpt_description_prompt,
+        prompt: audio.prompt,
+        type: audio.type,
+        tags: audio.tags,
+        negative_tags: audio.negative_prompt,
+        duration: audio.duration
       }));
     }
   }
 
   /**
    * Generates lyrics based on a given prompt.
-   * @param prompt The prompt for generating lyrics.
-   * @returns The generated lyrics text.
+   * @param prompt The prompt to generate lyrics for.
+   * @returns A promise that resolves to the generated lyrics as a string.
    */
-  public async generateLyrics(prompt: string): Promise<string> {
+  public async generateLyrics(prompt: string): Promise<any> {
     await this.keepAlive(false);
-    // Initiate lyrics generation
-    const generateResponse = await this.client.post(
-      `${SunoApi.BASE_URL}/api/generate/lyrics/`,
-      { prompt }
-    );
-    const generateId = generateResponse.data.id;
+    const payload = { prompt: prompt };
 
-    // Poll for lyrics completion
-    let lyricsResponse = await this.client.get(
-      `${SunoApi.BASE_URL}/api/generate/lyrics/${generateId}`
+    let response = await this.client.post(
+      `${SunoApi.BASE_URL}/api/v2/lyrics/create`,
+      payload,
+      {
+        timeout: 10000 // 10 seconds timeout
+      }
     );
-    while (lyricsResponse?.data?.status !== 'complete') {
-      await sleep(2); // Wait for 2 seconds before polling again
-      lyricsResponse = await this.client.get(
-        `${SunoApi.BASE_URL}/api/generate/lyrics/${generateId}`
-      );
+
+    if (response.status !== 200) {
+      throw new Error('Error response:' + response.statusText);
     }
+    const taskId = response.data.task_id;
 
-    // Return the generated lyrics text
-    return lyricsResponse.data;
+    const startTime = Date.now();
+    while (Date.now() - startTime < 60000) {
+      response = await this.client.get(
+        `${SunoApi.BASE_URL}/api/v2/lyrics/task/${taskId}`,
+        {
+          timeout: 10000,
+        }
+      )
+      if (response.data.status === 'completed') {
+        return response.data.data;
+      } else if (response.data.status === 'failed') {
+        throw new Error('Lyrics generation failed: ' + response.data.error_message);
+      }
+      await sleep(2, 3);
+    }
+    throw new Error('Lyrics generation timed out.');
   }
 
   /**
@@ -693,7 +702,55 @@ class SunoApi {
     model?: string,
     wait_audio?: boolean
   ): Promise<AudioInfo[]> {
-    return this.generateSongs(prompt, true, tags, title, false, model, wait_audio, negative_tags, 'extend', audioId, continueAt);
+    await this.keepAlive();
+    const payload: any = {
+      audioId: audioId,
+      prompt: prompt,
+      continueAt: continueAt,
+      defaultParamFlag: true,
+      style: tags,
+      title: title,
+      model: model || DEFAULT_MODEL
+    };
+
+    if (negative_tags) {
+      payload.negativeStyle = negative_tags;
+    }
+
+    const response = await this.client.post(
+      `${SunoApi.BASE_URL}/api/v1/generate/extend`,
+      payload,
+      {
+        timeout: 10000 // 10 seconds timeout
+      }
+    );
+    
+    if (response.status !== 200) {
+      throw new Error('Error response:' + response.statusText);
+    }
+
+    const { clips } = response.data;
+    if (!clips || clips.length === 0) {
+      return [];
+    }
+
+    return clips.map((audio: any) => ({
+      id: audio.id,
+      title: audio.title,
+      image_url: audio.image_url || audio.source_image_url,
+      lyric: audio.lyric || audio.lyrics || '',
+      audio_url: audio.audio_url || audio.source_audio_url,
+      video_url: audio.video_url,
+      created_at: audio.created_at || audio.createTime,
+      model_name: audio.model_name,
+      status: audio.status,
+      gpt_description_prompt: audio.gpt_description_prompt,
+      prompt: audio.prompt,
+      type: audio.type,
+      tags: audio.tags,
+      negative_tags: audio.negativeStyle,
+      duration: audio.duration
+    }));
   }
 
   /**
@@ -787,9 +844,7 @@ class SunoApi {
       id: audio.id,
       title: audio.title,
       image_url: audio.image_url,
-      lyric: audio.metadata.prompt
-        ? this.parseLyrics(audio.metadata.prompt)
-        : '',
+      lyric: (audio.metadata.lyrics && !audio.metadata.prompt?.includes('instrumental')) ? audio.metadata.lyrics : '',
       audio_url: audio.audio_url,
       video_url: audio.video_url,
       created_at: audio.created_at,
